@@ -1,39 +1,46 @@
+#include <stdint.h>
+#include <stdlib.h>
 #include "string.h"
+#ifndef Flash_Erase
 #include "flash.h"
+#endif
 #include "storage.h"
 #include "Resconfig.h"
 
 typedef struct {
 	uint16_t Size; //first saved on power off
 	uint8_t ID;
-	uint8_t Revision;
+	uint8_t Version;
 	uint32_t CRC_result;
 } header;
 
-//your structures, to be stored in flash. should be defined somewhere
-extern const intptr_t *Storage_Address[];
-extern const uint16_t Storage_Size[];
+const StorageData_t *storageStructInfo;
+uint16_t storageInfoSize = 0;
+intptr_t *banks[2] = { 0 };
+int32_t cnt[2] = { 0 };
+int valid[2] = { 0 };
+int activeBank = 0;
+uint8_t banksSwap = 0;
+enum {
+	Bank0, Bank1
+};
 
-//ld scripts global varibles
-extern unsigned int __storage_start__;
-//todo add check on storage end
-extern unsigned int __storage_end__;
-
-#define FLASH_ADDRES_BANK0  (intptr_t*)(&__storage_start__)
-#define FLASH_ADDRES_BANK1 (intptr_t*)((uint32_t)(&__storage_start__) + FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)
-intptr_t *validBank = 0;
-intptr_t *invalidBank = 0;
-header *writingPosition = 0;
-
+#define CRC_CONST 0xC0FFEE
 //local functions
-void getValidBank(void);
+void checkBanks(void);
 header* searchLatestValid(uint8_t structindex, const intptr_t *bank);
-void eraseBank(intptr_t *bank);
+void eraseBank(uint8_t bankIndex);
+#ifdef STORAGE_CRC
 uint32_t calculateCRC(const void *address, uint16_t n);
+#endif
 header* searchEnd(intptr_t *bank);
-uint8_t checkEmptyEnd(intptr_t *bank, header *header);
+int checkEmptyEnd(intptr_t *bank, header *header);
+int32_t checkStructuresAndValidate(intptr_t *bank, int32_t *count);
+uint32_t getAlignedSizeWithHeader(uint32_t size);
+int save_struct(intptr_t *address, uint32_t size, uint8_t structindex, uint8_t structversion);
+int moveStructuresAndErase(void);
 
-void Storage_Init(void) {
+void Storage_Init(const StorageData_t *storageInfo, uint16_t storageSize, intptr_t *bank1, intptr_t *bank2) {
 #ifdef STORAGE_CRC
 #if defined(STM32F4) | defined(STM32L4)
 	RCC->AHB1ENR |= RCC_AHB1ENR_CRCEN;
@@ -42,71 +49,98 @@ void Storage_Init(void) {
 	RCC->AHBENR |= RCC_AHBENR_CRCEN;
 #endif
 #endif
+	storageStructInfo = storageInfo;
+	storageInfoSize = storageSize;
+
+	banks[Bank0] = bank1, banks[Bank1] = bank2;
+	if (banks[Bank0] == 0 || banks[Bank1] == 0)
+		return;
 	//get valid bank
-	getValidBank();
-	writingPosition = searchEnd(validBank);
-	//fill in all structs in bank always
-	for (int i = 0; i < Struct_number; i++) {
-		header *valid = searchLatestValid(i, validBank);
-		//there is no such struct?
-		if (valid == 0) {
-			//try to get it in old bank
-			valid = searchLatestValid(i, invalidBank);
-			//exists?
-			if (valid != 0) {
-				//transfer from invalid bank
-				header *tostr = searchEnd(validBank);
-				Flash_Write(tostr, valid, valid->Size + sizeof(header));
-			} else
-				Storage_SaveData(i);
+	checkBanks();
+	recoverdata: //step to recover data in case if move structs fails, this may happen when both banks are full!
+	if (valid[activeBank] == 0) {
+		//we have a broken storage, store data in a stack and erase & write it again
+		//probably data got damaged while quick save, so active bank should have 1 or 2 structures
+		//if this code interrupted we will loose only small portion of data
+		if (cnt[!activeBank] == 0 && valid[!activeBank] == 1) {
+			//inactive bank valid and empty, write data to it without buffer
+			activeBank = !activeBank;
 		} else {
-			//same size = copy
-			/*if (valid->Size == Storage_Size[i]) {
-			 memcpy(Storage_Address[i], valid + 1, valid->Size);
-			 }else
-			 Storage_SaveData(i); //update new size*/
+			uint32_t totalsize = 0;
+			for (int i = 0; i < storageInfoSize; i++) {
+				header *validhdr = searchLatestValid(i, banks[activeBank]);
+				if (validhdr) {
+					totalsize += getAlignedSizeWithHeader(validhdr->Size);
+				}
+			}
+			if (totalsize > 0) {
+				//temporary heap bank
+				uint8_t buffer[totalsize];
+
+				uint32_t position = 0;
+				for (int i = 0; i < storageInfoSize; i++) {
+					header *validhdr = searchLatestValid(i, banks[activeBank]);
+					if (validhdr) {
+						memcpy(&buffer[position], validhdr, validhdr->Size + sizeof(header));
+						position += getAlignedSizeWithHeader(validhdr->Size);
+					}
+				}
+				int attempt = 3;
+				//try erase multiple time
+				do {
+					attempt--;
+					eraseBank(activeBank);
+					valid[activeBank] = checkStructuresAndValidate(banks[activeBank], &cnt[activeBank]);
+				} while (valid[activeBank] == 0 && attempt > 0);
+
+				//save using pointers
+				Flash_Write(banks[activeBank], &buffer, totalsize);
+				cnt[activeBank] = totalsize;
+			} else {
+				eraseBank(activeBank);
+			}
 		}
 	}
-	//clear invalid bank if needed
-	for (int i = 0; i < (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK / 4); i++) {
-		if (((uint32_t*) invalidBank)[i] != UINT32_MAX) {
-			eraseBank(invalidBank);
-			break;
+	//transfer leftovers from old bank and erase it
+	if (cnt[!activeBank] > 0 || valid[!activeBank] == 0) {
+		if (moveStructuresAndErase() == EXIT_FAILURE) //move always erases INACTIVE banks
+		{
+			//cant save anything, so it is invalid
+			valid[activeBank] = 0;
+			goto recoverdata;
 		}
 	}
-	/*
-	 for (uint8_t i = 0; i < Struct_number; i++) {
-	 if (Storage_LoadData(i) == ERROR) {
-	 Storage_SaveData(i); //length mismatch
-	 }
-	 }*/
+	//at the end of this route always have 1 EMPTY bank for quick save
+}
+
+uint32_t getAlignedSizeWithHeader(uint32_t size) {
+	uint32_t rdup = (size + sizeof(header) + FLASH_ALIGN - 1) / FLASH_ALIGN;
+	return rdup * FLASH_ALIGN;
 }
 
 /// Wipes all storage, but keep data in RAM
 void Storage_Wipe(void) {
-	eraseBank(FLASH_ADDRES_BANK0);
-	eraseBank(FLASH_ADDRES_BANK1);
-
-	validBank = FLASH_ADDRES_BANK0;
-	writingPosition = searchEnd(validBank);
+	eraseBank(Bank0);
+	eraseBank(Bank1);
+	activeBank = 0;
+	banksSwap = 0;
+	//saveAddress = 0;
 }
 
 void Storage_SaveAll(void) {
-	for (uint8_t i = 0; i < Struct_number; i++) {
+	for (uint8_t i = 0; i < storageInfoSize; i++) {
 		Storage_SaveData(i); //length mismatch
 	}
 }
 /// Returns pointer and size to latest valid data
 /// @param structindex Data index
 /// @return returns 0=ERROR if version or size differ, 1=SUCCESS
-Storage Storage_GetData(uint8_t structindex) {
-	header *dat = searchLatestValid(structindex, validBank);
-	Storage str;
-	if (dat == 0) {
-		str.Size = 0;
-		str.Data = 0;
-	} else {
+StorageData_t Storage_GetData(uint8_t structindex) {
+	header *dat = searchLatestValid(structindex, banks[activeBank]);
+	StorageData_t str = { 0 };
+	if (dat != 0) {
 		str.Size = dat->Size;
+		str.Version = dat->Version;
 		str.Data = (intptr_t*) (dat + 1);
 	}
 	return str;
@@ -114,85 +148,119 @@ Storage Storage_GetData(uint8_t structindex) {
 
 /// Loads data array by specified index
 /// @param structindex Data index
-/// @return returns 0=ERROR if version or size differ, 1=SUCCESS
+/// @return returns 1=EXIT_FAILURE if version or size differ, 0=EXIT_SUCCESS
 int Storage_LoadData(uint8_t structindex) {
-	if (Storage_Address[structindex] == 0)
-		return ERROR; //empty object
-	Storage data = Storage_GetData(structindex);
-	//todo add user version??
-	if (data.Size != Storage_Size[structindex])
-		return ERROR; //different size
-	memcpy((void*) Storage_Address[structindex], data.Data, data.Size);
-	return SUCCESS;
+	if (storageStructInfo[structindex].Data == 0)
+		return EXIT_FAILURE; //empty object
+	StorageData_t data = Storage_GetData(structindex);
+	if (data.Size != storageStructInfo[structindex].Size)
+		return EXIT_FAILURE; //different size
+	if (data.Version != storageStructInfo[structindex].Version)
+		return EXIT_FAILURE; //different version
+	memcpy((void*) storageStructInfo[structindex].Data, data.Data, data.Size);
+	return EXIT_SUCCESS;
 }
 
-void Storage_SaveData(uint8_t structindex) {
-	//check valid
-	if (Storage_Address[structindex] == 0 || Storage_Size[structindex] == 0)
-		return;
-
-	uint16_t bankMoved = 0;
-	intptr_t *oldvalidbank = validBank;
-	header *lastSavedAdress = searchLatestValid(structindex, validBank);
-	header *saveAddress = writingPosition;
-	if (saveAddress->Size != 0xFFFF && (uint32_t) saveAddress > (uint32_t) validBank
-			&& (uint32_t) saveAddress < ((uint32_t) validBank + FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK))
-		saveAddress = searchEnd(validBank);
-
-	header newsave;
-	uint32_t byteCount = Storage_Size[structindex] + sizeof(header);
-	//enough space?
-	if (((((int32_t) validBank + FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK) - (int32_t) saveAddress) < (int32_t) byteCount) || saveAddress == 0) {
-		//exchange banks
-		intptr_t *temp = validBank;
-		validBank = invalidBank;
-		invalidBank = temp;
-		bankMoved = 1;
-		//if bank moved, it should be empty
-		saveAddress = (header*) validBank;
-		//bank not ready to use, erase
-		if (saveAddress->Size != 0xFFFF)
-			eraseBank(validBank); //this should not happen under normal conditions
-
+int Storage_SaveData(uint8_t structindex) {
+	int res = Storage_SaveQuick(structindex);
+	if (banksSwap) {
+		//move other structures also. if this code failed on power off - storage_init will re-copy again
+		moveStructuresAndErase();
+		banksSwap = 0;
+		//try again?
+		if (res != EXIT_SUCCESS) {
+			res = Storage_SaveQuick(structindex);
+		}
 	}
-	//round rev
-	if (lastSavedAdress->Revision == 255)
-		newsave.Revision = 0;
-	else
-		newsave.Revision = lastSavedAdress->Revision + 1;
+	return res;
+}
+
+int Storage_SaveQuick(uint8_t structindex) {
+	return save_struct(storageStructInfo[structindex].Data, storageStructInfo[structindex].Size, structindex, storageStructInfo[structindex].Version);
+}
+
+int save_struct(intptr_t *address, uint32_t size, uint8_t structindex, uint8_t structversion) {
+	static volatile int semaphore = 0;
+	if (address == 0 || size == 0 || semaphore == 1)
+		return EXIT_FAILURE;
+
+	semaphore = 1;
+	header *saveAddress = 0;
+	intptr_t bankEnd = (intptr_t) banks[activeBank] + FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK;
+	//check position is in range of active bank
+	//if (saveAddress == 0 || saveAddress->Size != 0xFFFF || (intptr_t) saveAddress < (intptr_t) banks[activeBank] || (intptr_t) saveAddress > bankEnd)
+	saveAddress = searchEnd(banks[activeBank]);
+
+	uint32_t byteCount = getAlignedSizeWithHeader(size);
+	//enough space?
+	if (saveAddress == 0 || ((bankEnd - (intptr_t) saveAddress) < (intptr_t) byteCount)) {
+		//exchange banks
+		if (cnt[!activeBank] > 0 || banksSwap == 1 || valid[!activeBank] == 0) {
+			semaphore = 0;
+			banksSwap = 1; //force to move
+			return EXIT_FAILURE; //invalid inactive bank or already moved
+		}
+		activeBank = !activeBank;
+		banksSwap = 1;
+		//if bank moved, it should be empty
+		saveAddress = (header*) banks[activeBank];
+	}
 
 	//init header
+	header newsave = { 0 };
 	newsave.ID = structindex;
-	newsave.Size = Storage_Size[structindex];
-	newsave.CRC_result = calculateCRC(Storage_Address[structindex], Storage_Size[structindex]);
+	newsave.Size = size;
+	newsave.Version = structversion;
+#ifdef STORAGE_CRC
+	newsave.CRC_result = calculateCRC(address, size);
+#else
+	newsave.CRC_result = CRC_CONST;
+#endif
 	//save header first
 	Flash_Write(saveAddress, &newsave, sizeof(header));
 	//save data after header
-	Flash_Write(saveAddress + 1, (intptr_t*) Storage_Address[structindex], Storage_Size[structindex]);
-	//round size up, always 32 bit align on ending
-	uint32_t rdup = ((uint32_t) newsave.Size + FLASH_ALIGN - 1) / FLASH_ALIGN;
-	//update writing position
-	writingPosition = (header*) ((uint32_t) saveAddress + rdup * FLASH_ALIGN + sizeof(header));
-	//move other structures also. if this code failed on power off storage_init will re-copy again
-	if (bankMoved) {
-		//copy all structs from old bank to new excl. already one copied
-		for (uint8_t i = 0; i < Struct_number; i++) {
-			if (i != structindex) {
-				header *fromstr = searchLatestValid(i, oldvalidbank);
-				header *tostr = searchEnd(validBank);
-				Flash_Write(tostr, fromstr, fromstr->Size + sizeof(header));
+	Flash_Write(saveAddress + 1, address, size);
+	cnt[activeBank] += byteCount;
+	semaphore = 0;
+	return EXIT_SUCCESS;
+}
+
+void eraseBank(uint8_t bankIndex) {
+	if (bankIndex > 1)
+		return;
+	intptr_t *bankSelected = banks[bankIndex];
+	for (uint8_t i = 0; i < FLASH_PAGES_IN_BANK; i++) {
+		Flash_Erase((intptr_t*) ((intptr_t) bankSelected + FLASH_PAGE_SIZE_DATA * i));
+	}
+	valid[bankIndex] = 1;
+	cnt[bankIndex] = 0;
+}
+
+int moveStructuresAndErase(void) {
+	int res = EXIT_SUCCESS;
+	//Move structures from old one
+	for (int i = 0; i < storageInfoSize; i++) {
+		header *exist = searchLatestValid(i, banks[activeBank]);
+		//there is no such struct?
+		if (exist == 0) {
+			//try to get it in old bank
+			exist = searchLatestValid(i, banks[!activeBank]);
+			//exists?
+			if (exist != 0) {
+				//transfer from invalid bank
+				res = save_struct((intptr_t*) (exist + 1), exist->Size, exist->ID, exist->Version);
+				//probably cant transfer anything behind this point
+				if (res == EXIT_FAILURE)
+					return res;
 			}
 		}
-		eraseBank(oldvalidbank);
 	}
+	//clean up old - it should be prepeared for quick save
+	eraseBank(!activeBank);
+	return res;
 }
 
-void eraseBank(intptr_t *bank) {
-	for (uint8_t i = 0; i < FLASH_PAGES_IN_BANK; i++) {
-		Flash_Erase((intptr_t*) ((uint32_t) bank + FLASH_PAGE_SIZE_DATA * i));
-	}
-}
-
+#ifdef STORAGE_CRC
 uint32_t calculateCRC(const void *address, uint16_t n) {
 	uint16_t i;
 	uint32_t *addr = (uint32_t*) address;
@@ -215,103 +283,129 @@ uint32_t calculateCRC(const void *address, uint16_t n) {
 
 	return CRC->DR;
 }
+#endif
 
-void getValidBank(void) {
-	header *bank0 = (header*) FLASH_ADDRES_BANK0;
-	header *bank1 = (header*) FLASH_ADDRES_BANK1;
-	if (bank0->Size == 0xFFFF) {
-		if (bank1->Size == 0xFFFF) {
-			validBank = FLASH_ADDRES_BANK0;
-			invalidBank = FLASH_ADDRES_BANK1;
+void checkBanks(void) {
+	valid[Bank0] = checkStructuresAndValidate(banks[Bank0], &cnt[Bank0]);
+	valid[Bank1] = checkStructuresAndValidate(banks[Bank1], &cnt[Bank1]);
+
+	//selected bank
+	//check if banks are not-empty
+	if (cnt[Bank0] == 0) {
+		if (cnt[Bank1] == 0) {
+			activeBank = Bank0;
 		} else {
-			validBank = FLASH_ADDRES_BANK1;
-			invalidBank = FLASH_ADDRES_BANK0;
+			activeBank = Bank1;
 		}
 	} else {
-		if (bank1->Size == 0xFFFF) {
-			validBank = FLASH_ADDRES_BANK0;
-			invalidBank = FLASH_ADDRES_BANK1;
+		if (cnt[Bank1] == 0) {
+			activeBank = Bank0;
 		} else {
 			//every bank should contain every struct, so older bank is one with more structs
-			//get written length
-			header *one = (header*) ((uint32_t) searchEnd( FLASH_ADDRES_BANK0) - (uint32_t) FLASH_ADDRES_BANK0 );
-			header *two = (header*) ((uint32_t) searchEnd( FLASH_ADDRES_BANK1) - (uint32_t) FLASH_ADDRES_BANK1 );
-			//check border conditions also
-			if (two > one) {
-				validBank = FLASH_ADDRES_BANK0;
-				invalidBank = FLASH_ADDRES_BANK1;
+			if (cnt[Bank1] < cnt[Bank0]) {
+				activeBank = Bank1;
 			} else {
-				validBank = FLASH_ADDRES_BANK1;
-				invalidBank = FLASH_ADDRES_BANK0;
+				activeBank = Bank0;
 			}
-		}
-	}
-
-	header *end = searchEnd(validBank);
-	uint8_t bank_failed = checkEmptyEnd(validBank, end);
-	if (bank_failed) {
-		header *inv = (header*) invalidBank;
-		if (inv->Size != 0xFFFF) {
-			//there some data here, swap banks back
-			invalidBank = validBank;
-			validBank = (intptr_t*) inv;
-			eraseBank(invalidBank);
-		} else {
-			//well..data is gone now
-			eraseBank(validBank);
 		}
 	}
 }
 
 header* searchLatestValid(uint8_t structindex, const intptr_t *bank) {
 	//escape null type data
-	if (Storage_Address[structindex] == 0 || Storage_Size[structindex] == 0)
+	if (storageStructInfo[structindex].Data == 0 || storageStructInfo[structindex].Size == 0 || bank == 0)
 		return 0;
 
 	header *head = (header*) bank;
 	header *data = 0;
-
+	intptr_t bankEnd = (intptr_t) bank + FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK;
 	do {
-		//FFFF=end, bank oversized = error
-		if ((head->Size == 0xFFFF) || ((uint32_t) head + (uint32_t) head->Size + sizeof(header) > (uint32_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)))
+		//FFFF=end, bank oversized = error. todo add error check?
+		if (/*(head->Size == 0) ||*/(head->Size == UINT16_MAX) || ((intptr_t) head + (intptr_t) getAlignedSizeWithHeader(head->Size) > bankEnd))
 			return data;
+
 		if (head->ID == structindex) {
-			//new or zero roll-up?
-			if ((data == 0) || (head->Revision == (uint8_t) (data->Revision + 1))) {
-				//validate, head +1 = (uint32_t)head+ sizeof(header) go to data address
-				uint32_t crc = calculateCRC(head + 1, head->Size);
-				//todo add markers to previous data to speed up searching and CRC only latest one, if incorrect go back
-				if (crc == head->CRC_result)
-					data = head;
+			//validate, head +1 = (uint32_t)head+ sizeof(header) go to data address
+#ifdef STORAGE_CRC
+			uint32_t crc = calculateCRC(head + 1, head->Size);
+#else
+			uint32_t crc = CRC_CONST;
+#endif
+			//todo add markers to previous data to speed up searching and CRC only latest one, if incorrect go back
+			if (crc == head->CRC_result) {
+				data = head;
+			} else {
+#ifdef DEBUG
+				trace_printf("CRC storage mismatch id %d\n", head->ID);
+#endif
 			}
 		}
-
-		uint32_t rdup = (head->Size + FLASH_ALIGN - 1) / FLASH_ALIGN;
-		//round size up, always 32 bit align on ending
-		head = (header*) ((uint32_t) head + rdup * FLASH_ALIGN + sizeof(header));
-
-	} while ((uint32_t) head < ((uint32_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)));
+		head = (header*) ((intptr_t) head + getAlignedSizeWithHeader(head->Size));
+	} while ((intptr_t) head < bankEnd);
 	return data;
 }
 
 header* searchEnd(intptr_t *bank) {
 	header *head = (header*) bank;
 	do {
-		if (head->Size == 0xFFFF)
+		if (head->Size == UINT16_MAX)
 			return head;
 		uint32_t rdup = (head->Size + FLASH_ALIGN - 1) / FLASH_ALIGN;
 		//round size up, always 16 bit align on ending
-		head = (header*) ((uint32_t) head + rdup * FLASH_ALIGN + sizeof(header));
-	} while ((uint32_t) head < ((uint32_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)));
-	return 0;
+		head = (header*) ((intptr_t) head + rdup * FLASH_ALIGN + sizeof(header));
+	} while ((intptr_t) head < ((intptr_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)));
+	return 0; // no end found
 }
 
-uint8_t checkEmptyEnd(intptr_t *bank, header *header) {
-	uint32_t *position = (uint32_t*) header;
-	for (; (uint32_t)position < ((uint32_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK)); position++) {
+int32_t checkStructuresAndValidate(intptr_t *bank, int32_t *count) {
+	int32_t valid = 1;
+	int32_t counter = 0; //bytes written
+	header *head = (header*) bank;
+	intptr_t end = (intptr_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK);
+	//calculate structures at start
+	do {
+		//detect empty area beginning, allow size =0 cos some structures had it ;(
+		if (head->Size == UINT16_MAX)
+			break;
+		//round size up, always FLASH_ALIGN bytes align on ending
+		uint32_t size = getAlignedSizeWithHeader(head->Size);
+		//increment kinda-real structures
+		if ((intptr_t) ((intptr_t) head + size) > end) {
+			//boundary error detected
+			valid = 0;
+			break;
+		} else {
+			//count only valid size
+			counter += size;
+		}
+		head = (header*) (size + (intptr_t) head);
+	} while ((intptr_t) head < end);
 
-		if (*position != 0xFFFFFFFF)
-			return 1;
+	//scan end of flash that it is empty.
+	uint32_t *ptr = (uint32_t*) head;
+	for (; (intptr_t) ptr < end && valid != 0; ptr++) {
+		if (*ptr != UINT32_MAX) {
+			valid = 0; //FAULT
+		}
 	}
-	return 0;
+
+	if (count) {
+		*count = counter;
+	}
+	return valid;
+}
+
+int checkEmptyEnd(intptr_t *bank, header *header) {
+	intptr_t *position = (intptr_t*) header;
+	intptr_t end = ((intptr_t) bank + (FLASH_PAGE_SIZE_DATA * FLASH_PAGES_IN_BANK));
+	if (header == 0 || (intptr_t) header == end) {
+		return EXIT_FAILURE;
+	}
+	for (; (intptr_t) position < end; position++) {
+
+		if ((uintptr_t) *position != UINTPTR_MAX) {
+			return EXIT_FAILURE;
+		}
+	}
+	return EXIT_SUCCESS;
 }

@@ -11,12 +11,14 @@
 
 typedef struct {
 	uint16_t Size;
+	uint8_t Version;
 	intptr_t* Data;
-} Storage;
+} StorageData_t;
 
-void Storage_Init(void);
-Storage Storage_GetData(uint8_t structindex);
+void Storage_Init(const StorageData_t *storageInfo, uint16_t storageSize, intptr_t *bank1, intptr_t *bank2);
+StorageData_t Storage_GetData(uint8_t structindex);
 int Storage_LoadData(uint8_t structindex);
-void Storage_SaveData(uint8_t Struct_Name);
+int Storage_SaveData(uint8_t structindex);
+int Storage_SaveQuick(uint8_t structindex);
 void Storage_Wipe(void);
 void Storage_SaveAll(void);
