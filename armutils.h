@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "stdint.h"
+
 typedef enum {
 	ARM_FPU_none, ARM_FPU_single_precision, ARM_FPU_double_precision
 } ARM_FPU_t;
